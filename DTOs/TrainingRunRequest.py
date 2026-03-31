@@ -7,7 +7,8 @@ class TrainingRunRequest(BaseModel):
     downloadUrl: str
     callbackUrl: str
     timeColumn: str = "Год"
-    forecastPeriod: int | None = None
+    forecastHorizon: int = 1
+    forecastFrequency: str = "Auto"
     targetColumn: str
     featureColumns: list[str]
     model: Model
