@@ -12,10 +12,11 @@ from DTOs.TrainingRunRequest import TrainingRunRequest
 from DTOs.TrainingRunCallbackRequest import TrainingRunCallbackRequest
 from DTOs.TrainingRunResponse import TrainingRunResponse
 from models.Metric import Metric
-from sklearn.linear_model import Lasso, LinearRegression
+from sklearn.linear_model import LassoCV, LinearRegression
 from sklearn.preprocessing import StandardScaler
 
 app = FastAPI()
+DEFAULT_VALIDATION_FRACTION = 0.2
 
 
 @app.post("/api/trainingrun/start", response_model=TrainingRunResponse)
@@ -82,6 +83,7 @@ async def process_training_run(request: TrainingRunRequest, external_job_id: str
                 forecast_horizon,
             )
             time_values = frame["__period_index"].to_numpy(dtype=float).reshape(-1, 1)
+            split_time_col = "__period_index"
         else:
             frame, future_periods, forecast_timestamps, resolved_time_col = prepare_yearly_training_data(
                 data,
@@ -91,7 +93,9 @@ async def process_training_run(request: TrainingRunRequest, external_job_id: str
                 forecast_horizon,
             )
             time_values = frame[resolved_time_col].to_numpy(dtype=float).reshape(-1, 1)
+            split_time_col = resolved_time_col
 
+        # Экстраполяция фичей
         feature_models = {}
         for feature in features:
             lr = LinearRegression()
@@ -103,20 +107,25 @@ async def process_training_run(request: TrainingRunRequest, external_job_id: str
             for feature in features
         })
 
-        scaler = StandardScaler()
-        x_historical_scaled = scaler.fit_transform(frame[features])
-        future_x_scaled = scaler.transform(future_x)
+        split_data = split_and_scale_time_series_data(
+            history_df=frame,
+            future_df=future_x.assign(**{split_time_col: future_periods}),
+            time_col=split_time_col,
+            target_col=target_col,
+            features=features,
+            validation_fraction=DEFAULT_VALIDATION_FRACTION,
+        )
 
-        lasso = Lasso(alpha=0.01, max_iter=10000)
-        lasso.fit(x_historical_scaled, frame[target_col])
+        lasso = LassoCV(alphas=[0.001, 0.01, 0.1, 1.0], cv=3)
+        lasso.fit(split_data["X_train_scaled"], split_data["y_train"])
 
-        historical_pred = lasso.predict(x_historical_scaled)
-        forecast_pred = lasso.predict(future_x_scaled)
+        validation_pred = lasso.predict(split_data["X_val_scaled"])
+        forecast_pred = lasso.predict(split_data["X_future_scaled"])
 
-        actual = frame[target_col].to_numpy(dtype=float)
-        mae = float(np.mean(np.abs(actual - historical_pred)))
-        rmse = float(np.sqrt(np.mean((actual - historical_pred) ** 2)))
-        ss_res = float(np.sum((actual - historical_pred) ** 2))
+        actual = split_data["y_val"].to_numpy(dtype=float)
+        mae = float(np.mean(np.abs(actual - validation_pred)))
+        rmse = float(np.sqrt(np.mean((actual - validation_pred) ** 2)))
+        ss_res = float(np.sum((actual - validation_pred) ** 2))
         ss_tot = float(np.sum((actual - actual.mean()) ** 2))
         r2 = 1.0 if ss_tot == 0 else float(1 - (ss_res / ss_tot))
 
@@ -198,7 +207,7 @@ def load_data(file_path: Path) -> pd.DataFrame:
 
     raise ValueError(f"Unsupported file format: {suffix}")
 
-
+# Убирает строки с пустыми значениями в времени/целевой, сортирует, интерполирует пропуски в features
 def prepare_training_frame(
     frame: pd.DataFrame,
     time_col: str,
@@ -223,6 +232,66 @@ def prepare_training_frame(
         raise ValueError("Dataset must contain at least two valid rows after filling empty values")
 
     return frame
+
+
+def split_and_scale_time_series_data(
+    history_df: pd.DataFrame,
+    future_df: pd.DataFrame,
+    time_col: str,
+    target_col: str,
+    features: list[str],
+    validation_fraction: float = 0.2,
+    scaler: StandardScaler | None = None,
+) -> dict[str, pd.DataFrame | pd.Series | StandardScaler]:
+    history_df = history_df.sort_values(time_col).reset_index(drop=True).copy()
+    future_df = future_df.sort_values(time_col).reset_index(drop=True).copy()
+
+    if not 0 < validation_fraction < 1:
+        raise ValueError("validation_fraction must be between 0 and 1")
+
+    if len(history_df.index) < 2:
+        raise ValueError("Need at least two historical rows to create train and validation splits")
+
+    split_idx = int(len(history_df.index) * (1 - validation_fraction))
+    split_idx = max(1, min(split_idx, len(history_df.index) - 1))
+
+    train_df = history_df.iloc[:split_idx].copy()
+    val_df = history_df.iloc[split_idx:].copy()
+
+    if train_df.empty or val_df.empty:
+        raise ValueError("Train/validation split produced an empty subset")
+
+    if scaler is None:
+        scaler = StandardScaler()
+
+    X_train_scaled = pd.DataFrame(
+        scaler.fit_transform(train_df[features]),
+        columns=features,
+        index=train_df.index,
+    )
+    X_val_scaled = pd.DataFrame(
+        scaler.transform(val_df[features]),
+        columns=features,
+        index=val_df.index,
+    )
+    X_future_scaled = pd.DataFrame(
+        scaler.transform(future_df[features]),
+        columns=features,
+        index=future_df.index,
+    )
+
+    return {
+        "X_train_scaled": X_train_scaled,
+        "y_train": train_df[target_col],
+        "X_val_scaled": X_val_scaled,
+        "y_val": val_df[target_col],
+        "X_future_scaled": X_future_scaled,
+        "future_times": future_df[time_col],
+        "scaler": scaler,
+        "train_df": train_df,
+        "val_df": val_df,
+        "future_df": future_df,
+    }
 
 
 def normalize_forecast_frequency(value: str | None) -> str:
