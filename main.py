@@ -11,8 +11,9 @@ from fastapi import BackgroundTasks, FastAPI
 from DTOs.TrainingRunRequest import TrainingRunRequest
 from DTOs.TrainingRunCallbackRequest import TrainingRunCallbackRequest
 from DTOs.TrainingRunResponse import TrainingRunResponse
+from models.Model import Model
 from models.Metric import Metric
-from sklearn.linear_model import LassoCV, LinearRegression
+from sklearn.linear_model import ElasticNetCV, LassoCV, LinearRegression, RidgeCV
 from sklearn.preprocessing import StandardScaler
 
 app = FastAPI()
@@ -116,11 +117,10 @@ async def process_training_run(request: TrainingRunRequest, external_job_id: str
             validation_fraction=DEFAULT_VALIDATION_FRACTION,
         )
 
-        lasso = LassoCV(alphas=[0.001, 0.01, 0.1, 1.0], cv=3)
-        lasso.fit(split_data["X_train_scaled"], split_data["y_train"])
-
-        validation_pred = lasso.predict(split_data["X_val_scaled"])
-        forecast_pred = lasso.predict(split_data["X_future_scaled"])
+        _, validation_pred, forecast_pred = train_and_predict(
+            model_request=request.model,
+            split_data=split_data,
+        )
 
         actual = split_data["y_val"].to_numpy(dtype=float)
         mae = float(np.mean(np.abs(actual - validation_pred)))
@@ -281,10 +281,13 @@ def split_and_scale_time_series_data(
     )
 
     return {
+        "X_train": train_df[features].copy(),
         "X_train_scaled": X_train_scaled,
         "y_train": train_df[target_col],
+        "X_val": val_df[features].copy(),
         "X_val_scaled": X_val_scaled,
         "y_val": val_df[target_col],
+        "X_future": future_df[features].copy(),
         "X_future_scaled": X_future_scaled,
         "future_times": future_df[time_col],
         "scaler": scaler,
@@ -292,6 +295,72 @@ def split_and_scale_time_series_data(
         "val_df": val_df,
         "future_df": future_df,
     }
+
+
+def train_and_predict(
+    model_request: Model,
+    split_data: dict[str, pd.DataFrame | pd.Series | StandardScaler],
+):
+    algorithm = resolve_model_algorithm(model_request)
+    use_scaled_features = algorithm in {"lasso", "ridge", "elasticnet", "linear_regression"}
+
+    feature_suffix = "_scaled" if use_scaled_features else ""
+    x_train = split_data[f"X_train{feature_suffix}"]
+    x_val = split_data[f"X_val{feature_suffix}"]
+    x_future = split_data[f"X_future{feature_suffix}"]
+    y_train = split_data["y_train"]
+
+    model = build_model(algorithm, len(y_train))
+    model.fit(x_train, y_train)
+
+    validation_pred = model.predict(x_val)
+    forecast_pred = model.predict(x_future)
+
+    return model, validation_pred, forecast_pred
+
+
+def resolve_model_algorithm(model_request: Model) -> str:
+    raw_value = (model_request.algorithm or model_request.name or "").strip().lower().replace("-", "_")
+    aliases = {
+        "linear": "linear_regression",
+        "linearregression": "linear_regression",
+        "linear_regression": "linear_regression",
+        "lasso": "lasso",
+        "lassocv": "lasso",
+        "ridge": "ridge",
+        "ridgecv": "ridge",
+        "elasticnet": "elasticnet",
+        "elastic_net": "elasticnet",
+        "elasticnetcv": "elasticnet",
+    }
+
+    if raw_value not in aliases:
+        raise ValueError(
+            f"Unsupported model algorithm '{model_request.algorithm or model_request.name}'. "
+            "Supported values: linear_regression, lasso, ridge, elasticnet"
+        )
+
+    return aliases[raw_value]
+
+
+def build_model(algorithm: str, train_size: int):
+    cv_folds = min(3, max(2, train_size - 1))
+
+    if algorithm == "linear_regression":
+        return LinearRegression()
+    if algorithm == "lasso":
+        return LassoCV(alphas=[0.001, 0.01, 0.1, 1.0], cv=cv_folds, max_iter=10000)
+    if algorithm == "ridge":
+        return RidgeCV(alphas=[0.001, 0.01, 0.1, 1.0, 10.0])
+    if algorithm == "elasticnet":
+        return ElasticNetCV(
+            alphas=[0.001, 0.01, 0.1, 1.0],
+            l1_ratio=[0.1, 0.5, 0.7, 0.9, 0.95, 1.0],
+            cv=cv_folds,
+            max_iter=10000,
+        )
+
+    raise ValueError(f"Unsupported model algorithm '{algorithm}'")
 
 
 def normalize_forecast_frequency(value: str | None) -> str:
