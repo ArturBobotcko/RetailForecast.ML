@@ -1,8 +1,10 @@
 import csv
+import random
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
+import traceback
 
 import httpx
 import numpy as np
@@ -13,11 +15,26 @@ from DTOs.TrainingRunCallbackRequest import TrainingRunCallbackRequest
 from DTOs.TrainingRunResponse import TrainingRunResponse
 from models.Model import Model
 from models.Metric import Metric
-from sklearn.linear_model import ElasticNetCV, LassoCV, LinearRegression, RidgeCV
-from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import ElasticNetCV, LassoCV, LinearRegression, RidgeCV, Ridge
+from sklearn.preprocessing import StandardScaler, PolynomialFeatures
+from sklearn.pipeline import make_pipeline
+from xgboost import XGBRegressor
+from prophet import Prophet
+from pmdarima import auto_arima
+from statsmodels.tsa.stattools import acf
 
 app = FastAPI()
 DEFAULT_VALIDATION_FRACTION = 0.2
+GLOBAL_RANDOM_SEED = 42
+
+
+def set_all_seeds(seed: int = GLOBAL_RANDOM_SEED) -> None:
+    """Set all random seeds for reproducibility"""
+    random.seed(seed)
+    np.random.seed(seed)
+
+
+set_all_seeds(GLOBAL_RANDOM_SEED)
 
 
 @app.post("/api/trainingrun/start", response_model=TrainingRunResponse)
@@ -96,24 +113,43 @@ async def process_training_run(request: TrainingRunRequest, external_job_id: str
             time_values = frame[resolved_time_col].to_numpy(dtype=float).reshape(-1, 1)
             split_time_col = resolved_time_col
 
-        # Экстраполяция фичей
+        LAG_PERIODS = detect_optimal_lags(frame[target_col], forecast_horizon=forecast_horizon)
+        frame["Q1"] = (frame["Квартал"] == 1).astype(int)
+        frame["Q2"] = (frame["Квартал"] == 2).astype(int)
+        frame["Q3"] = (frame["Квартал"] == 3).astype(int)
+
+        frame, lag_cols = add_lag_features(frame, target_col, LAG_PERIODS)
+        time_values = frame[split_time_col].to_numpy(dtype=float).reshape(-1, 1)
+
+        # Feature extrapolation disabled for now - focus on training features
         feature_models = {}
         for feature in features:
-            lr = LinearRegression()
-            lr.fit(time_values, frame[feature].values)
-            feature_models[feature] = lr
+            # Use last value forward for simple extrapolation
+            last_value = frame[feature].iloc[-1]
+            # Create a simple model that predicts last value
+            class ConstantPredictor:
+                def __init__(self, value):
+                    self.value = value
+                def predict(self, X):
+                    return np.full(len(X), self.value)
+            feature_models[feature] = ConstantPredictor(last_value)
 
         future_x = pd.DataFrame({
             feature: feature_models[feature].predict(future_periods.reshape(-1, 1))
             for feature in features
         })
 
+        future_lag_df = build_future_lag_features(frame, target_col, LAG_PERIODS, forecast_horizon)
+        future_x = pd.concat([future_x.reset_index(drop=True), future_lag_df], axis=1)
+
+        all_features = features + lag_cols
+
         split_data = split_and_scale_time_series_data(
             history_df=frame,
             future_df=future_x.assign(**{split_time_col: future_periods}),
             time_col=split_time_col,
             target_col=target_col,
-            features=features,
+            features=all_features,
             validation_fraction=DEFAULT_VALIDATION_FRACTION,
         )
 
@@ -123,11 +159,23 @@ async def process_training_run(request: TrainingRunRequest, external_job_id: str
         )
 
         actual = split_data["y_val"].to_numpy(dtype=float)
+        
         mae = float(np.mean(np.abs(actual - validation_pred)))
         rmse = float(np.sqrt(np.mean((actual - validation_pred) ** 2)))
         ss_res = float(np.sum((actual - validation_pred) ** 2))
         ss_tot = float(np.sum((actual - actual.mean()) ** 2))
         r2 = 1.0 if ss_tot == 0 else float(1 - (ss_res / ss_tot))
+        
+        print(f"  ss_res: {ss_res:.2f}, ss_tot: {ss_tot:.2f}, R²: {r2:.4f}")
+        
+        # Robust MAPE calculation (handles near-zero values)
+        mape_threshold = 1e-6
+        mape_mask = np.abs(actual) > mape_threshold
+        if mape_mask.sum() > 0:
+            mape = float(np.mean(np.abs((actual[mape_mask] - validation_pred[mape_mask]) / actual[mape_mask])) * 100)
+            mape = min(mape, 1000.0)  # Cap at 1000% to avoid extreme values
+        else:
+            mape = 0.0
 
         callback_request = TrainingRunCallbackRequest(
             status="Completed",
@@ -135,6 +183,7 @@ async def process_training_run(request: TrainingRunRequest, external_job_id: str
                 Metric(name="mae", value=round(mae, 6)),
                 Metric(name="rmse", value=round(rmse, 6)),
                 Metric(name="r2", value=round(r2, 6)),
+                Metric(name="mape", value=round(mape, 2))
             ],
             forecast=[
                 {
@@ -151,7 +200,7 @@ async def process_training_run(request: TrainingRunRequest, external_job_id: str
             status="Failed",
             metrics=[],
             forecast=[],
-            error=str(ex),
+            error=f"{type(ex).__name__}: {ex}\n{traceback.format_exc()}",
             externalJobId=external_job_id,
         )
     finally:
@@ -264,8 +313,11 @@ def split_and_scale_time_series_data(
     if scaler is None:
         scaler = StandardScaler()
 
+    # FIT scaler on ALL historical data to ensure validation values are properly scaled
+    scaler.fit(history_df[features])
+
     X_train_scaled = pd.DataFrame(
-        scaler.fit_transform(train_df[features]),
+        scaler.transform(train_df[features]),
         columns=features,
         index=train_df.index,
     )
@@ -302,7 +354,14 @@ def train_and_predict(
     split_data: dict[str, pd.DataFrame | pd.Series | StandardScaler],
 ):
     algorithm = resolve_model_algorithm(model_request)
-    use_scaled_features = algorithm in {"lasso", "ridge", "elasticnet", "linear_regression"}
+
+    if algorithm == "prophet":
+        return _train_and_predict_prophet(split_data, split_data.get("future_times"))
+    
+    if algorithm == "arima":
+        return _train_and_predict_arima(split_data)
+
+    use_scaled_features = algorithm in {"lasso", "ridge", "elasticnet", "linear_regression", "xgboost"}
 
     feature_suffix = "_scaled" if use_scaled_features else ""
     x_train = split_data[f"X_train{feature_suffix}"]
@@ -312,12 +371,87 @@ def train_and_predict(
 
     model = build_model(algorithm, len(y_train))
     model.fit(x_train, y_train)
-
+    
     validation_pred = model.predict(x_val)
     forecast_pred = model.predict(x_future)
 
     return model, validation_pred, forecast_pred
 
+def _train_and_predict_prophet(split_data: dict, future_times) -> tuple:
+    """Минимальная обёртка для Prophet — не трогает остальную логику"""
+    train_df = split_data["train_df"].copy()
+    val_df = split_data["val_df"].copy()
+    future_df = split_data["future_df"].copy()
+
+    # Prophet требует колонку "ds" (datetime) и "y"
+    ds_col = "ds"
+    train_df = train_df.rename(columns={"__period_index" if "__period_index" in train_df.columns else split_data.get("future_times", "Год"): ds_col})
+    val_df = val_df.rename(columns={"__period_index" if "__period_index" in val_df.columns else split_data.get("future_times", "Год"): ds_col})
+    future_df = future_df.rename(columns={"__period_index" if "__period_index" in future_df.columns else split_data.get("future_times", "Год"): ds_col})
+
+    # Преобразуем в datetime (Prophet любит настоящий datetime)
+    train_df[ds_col] = pd.to_datetime(train_df[ds_col], errors="coerce")
+    val_df[ds_col] = pd.to_datetime(val_df[ds_col], errors="coerce")
+    future_df[ds_col] = pd.to_datetime(future_df[ds_col], errors="coerce")
+
+    # Основная модель Prophet
+    model = Prophet(
+        yearly_seasonality=True,
+        weekly_seasonality=False,
+        daily_seasonality=False,
+        seasonality_mode="multiplicative"   # для ритейла обычно лучше
+    )
+
+    # Добавляем все фичи как регрессоры
+    features = [col for col in split_data["X_train"].columns if col not in {"__period_index", "Год", "Квартал"}]
+    for f in features:
+        if f in train_df.columns:
+            model.add_regressor(f)
+
+    # Fit
+    model.fit(train_df.rename(columns={split_data["y_train"].name: "y"}))
+
+    # Predict на валидации и будущем
+    val_pred = model.predict(val_df)[["yhat"]].values.ravel()
+    forecast_pred = model.predict(future_df)[["yhat"]].values.ravel()
+
+    return model, val_pred, forecast_pred
+
+def _train_and_predict_arima(split_data: dict) -> tuple:
+    """Auto-ARIMA (SARIMAX) с автоматическим подбором параметров"""
+    train_df = split_data["train_df"].copy()
+    val_df = split_data["val_df"].copy()
+    future_df = split_data["future_df"].copy()
+
+    y_train = split_data["y_train"].values
+    exog_train = split_data["X_train"].values
+    exog_val = split_data["X_val"].values
+    exog_future = split_data["X_future"].values
+
+    # Auto-ARIMA с сезонностью m=4 (для квартальных данных)
+    model = auto_arima(
+        y_train,
+        exogenous=exog_train,
+        start_p=0, start_q=0,
+        max_p=3, max_q=3,
+        d=None,                # auto
+        seasonal=True,
+        m=4,                   # квартальная сезонность
+        start_P=0, start_Q=0,
+        max_P=2, max_Q=2,
+        D=None,
+        trace=False,
+        error_action='ignore',
+        suppress_warnings=True,
+        stepwise=True,
+        n_fits=20
+    )
+
+    # Predict
+    validation_pred = model.predict(n_periods=len(val_df), exogenous=exog_val)
+    forecast_pred = model.predict(n_periods=len(future_df), exogenous=exog_future)
+
+    return model, validation_pred, forecast_pred
 
 def resolve_model_algorithm(model_request: Model) -> str:
     raw_value = (model_request.algorithm or model_request.name or "").strip().lower().replace("-", "_")
@@ -332,6 +466,10 @@ def resolve_model_algorithm(model_request: Model) -> str:
         "elasticnet": "elasticnet",
         "elastic_net": "elasticnet",
         "elasticnetcv": "elasticnet",
+        "xgboost": "xgboost",
+        "prophet": "prophet",
+        "arima": "arima",
+        "auto_arima": "arima",
     }
 
     if raw_value not in aliases:
@@ -344,24 +482,151 @@ def resolve_model_algorithm(model_request: Model) -> str:
 
 
 def build_model(algorithm: str, train_size: int):
-    cv_folds = min(3, max(2, train_size - 1))
+    # Adaptive CV folds based on dataset size
+    if train_size < 10:
+        cv_folds = 2
+    elif train_size < 50:
+        cv_folds = 3
+    else:
+        cv_folds = min(5, train_size // 5)
 
     if algorithm == "linear_regression":
         return LinearRegression()
+    
     if algorithm == "lasso":
-        return LassoCV(alphas=[0.001, 0.01, 0.1, 1.0], cv=cv_folds, max_iter=10000)
+        # Data-adaptive alpha grid for Lasso
+        alphas = np.logspace(-3, 2, 12) if train_size > 50 else np.logspace(-2, 1, 8)
+        return LassoCV(alphas=alphas, cv=cv_folds, max_iter=50000, tol=1e-4, random_state=42)
+    
     if algorithm == "ridge":
-        return RidgeCV(alphas=[0.001, 0.01, 0.1, 1.0, 10.0])
+        # Data-adaptive alpha grid for Ridge
+        alphas = np.logspace(-3, 2, 12) if train_size > 50 else np.logspace(-2, 1, 8)
+        return RidgeCV(alphas=alphas, cv=cv_folds)
+    
     if algorithm == "elasticnet":
+        # Data-adaptive hyperparameters
+        alphas = np.logspace(-3, 2, 12) if train_size > 50 else np.logspace(-2, 1, 8)
+        l1_ratios = [0.1, 0.3, 0.5, 0.7, 0.9, 0.95, 1.0]
         return ElasticNetCV(
-            alphas=[0.001, 0.01, 0.1, 1.0],
-            l1_ratio=[0.1, 0.5, 0.7, 0.9, 0.95, 1.0],
+            alphas=alphas,
+            l1_ratio=l1_ratios,
             cv=cv_folds,
-            max_iter=10000,
+            max_iter=50000,
+            tol=1e-4,
+            random_state=42
         )
+    
+    if algorithm == "xgboost":
+        # Aggressive regularization for small datasets
+        if train_size < 50:
+            n_estimators = 50  # Much smaller
+            learning_rate = 0.2  # Higher to converge faster
+            max_depth = 2  # Very shallow
+            min_child_weight = 5  # Very restrictive
+            subsample = 0.6  # More conservative sampling
+            colsample_bytree = 0.6
+        elif train_size < 100:
+            n_estimators = 100
+            learning_rate = 0.1
+            max_depth = 3
+            min_child_weight = 3
+            subsample = 0.7
+            colsample_bytree = 0.7
+        else:
+            n_estimators = 300
+            learning_rate = 0.03
+            max_depth = 5
+            min_child_weight = 3
+            subsample = 0.8
+            colsample_bytree = 0.8
+        
+        return XGBRegressor(
+            n_estimators=n_estimators,
+            learning_rate=learning_rate,
+            max_depth=max_depth,
+            min_child_weight=min_child_weight,
+            subsample=subsample,
+            colsample_bytree=colsample_bytree,
+            colsample_bylevel=0.6 if train_size < 50 else 0.8,
+            reg_alpha=0.1 if train_size < 50 else 0.01,  # Stronger L1 for small data
+            reg_lambda=2.0 if train_size < 50 else 1.0,  # Stronger L2 for small data
+            random_state=42,
+            objective="reg:squarederror",
+            early_stopping_rounds=5 if train_size > 50 else None
+        )
+    
+
+    if algorithm == "prophet":
+        return "prophet"
+    if algorithm == "arima":
+        return "arima"
 
     raise ValueError(f"Unsupported model algorithm '{algorithm}'")
 
+def detect_optimal_lags(series: pd.Series, forecast_horizon: int = 1, max_lags: int = 12, significance_threshold: float = 1.96) -> list[int]:
+    """
+    Detect optimal lag periods using ACF (autocorrelation function).
+    Returns lags that are statistically significant.
+    """
+    try:
+        series_clean = series.dropna()
+        if len(series_clean) < 10:
+            return [1]
+        
+        # Calculate ACF up to max_lags
+        acf_values = acf(series_clean, nlags=min(max_lags, len(series_clean) - 2), fft=False)
+        
+        # Confidence interval threshold (95% confidence)
+        ci = significance_threshold / np.sqrt(len(series_clean))
+        
+        # Find significant lags (lags where ACF exceeds confidence interval)
+        significant_lags = [i for i in range(1, len(acf_values)) 
+                           if abs(acf_values[i]) > ci]
+        
+        if not significant_lags:
+            return [1]  # Fallback to lag-1 if none significant
+        
+        # Ensure we have at least forecast_horizon lags
+        min_lags = max(1, forecast_horizon)
+        if max(significant_lags) < min_lags:
+            significant_lags = list(range(1, min_lags + 1))
+        
+        return sorted(significant_lags[:4])  # Cap at 4 lags for performance
+    except Exception as e:
+        # Fallback to default lags if ACF fails
+        return [1, 2]
+
+
+def add_lag_features(
+        frame: pd.DataFrame,
+        target_col: str,
+        lags: list[int],
+) -> tuple[pd.DataFrame, list[str]]:
+    frame = frame.copy()
+    lag_cols = []
+    for lag in lags:
+        col_name = f"{target_col}_lag{lag}"
+        frame[col_name] = frame[target_col].shift(lag)
+        lag_cols.append(col_name)
+
+    frame = frame.dropna(subset=lag_cols).reset_index(drop=True)
+    return frame, lag_cols
+
+def build_future_lag_features(
+    frame: pd.DataFrame,
+    target_col: str,
+    lags: list[int],
+    forecast_horizon: int,
+) -> pd.DataFrame:
+    target_history = list(frame[target_col].values)
+    rows = []
+    for h in range(forecast_horizon):
+        row = {}
+        for lag in lags:
+            idx = len(target_history) - lag + h
+            row[f"{target_col}_lag{lag}"] = target_history[max(0, min(idx, len(target_history) - 1))]
+        rows.append(row)
+    return pd.DataFrame(rows)
 
 def normalize_forecast_frequency(value: str | None) -> str:
     normalized = (value or "Auto").strip().lower()
