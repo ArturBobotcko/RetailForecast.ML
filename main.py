@@ -100,7 +100,6 @@ async def process_training_run(request: TrainingRunRequest, external_job_id: str
                 features,
                 forecast_horizon,
             )
-            time_values = frame["__period_index"].to_numpy(dtype=float).reshape(-1, 1)
             split_time_col = "__period_index"
         else:
             frame, future_periods, forecast_timestamps, resolved_time_col = prepare_yearly_training_data(
@@ -110,32 +109,21 @@ async def process_training_run(request: TrainingRunRequest, external_job_id: str
                 features,
                 forecast_horizon,
             )
-            time_values = frame[resolved_time_col].to_numpy(dtype=float).reshape(-1, 1)
             split_time_col = resolved_time_col
 
         LAG_PERIODS = detect_optimal_lags(frame[target_col], forecast_horizon=forecast_horizon)
-        frame["Q1"] = (frame["Квартал"] == 1).astype(int)
-        frame["Q2"] = (frame["Квартал"] == 2).astype(int)
-        frame["Q3"] = (frame["Квартал"] == 3).astype(int)
 
         frame, lag_cols = add_lag_features(frame, target_col, LAG_PERIODS)
-        time_values = frame[split_time_col].to_numpy(dtype=float).reshape(-1, 1)
 
-        # Feature extrapolation disabled for now - focus on training features
-        feature_models = {}
-        for feature in features:
-            # Use last value forward for simple extrapolation
-            last_value = frame[feature].iloc[-1]
-            # Create a simple model that predicts last value
-            class ConstantPredictor:
-                def __init__(self, value):
-                    self.value = value
-                def predict(self, X):
-                    return np.full(len(X), self.value)
-            feature_models[feature] = ConstantPredictor(last_value)
+        frame["trend"] = np.arange(len(frame)) / len(frame)
+
+        # 4. сезонность
+        if "Квартал" in frame.columns:
+            frame["sin_q"] = np.sin(2 * np.pi * frame["Квартал"] / 4)
+            frame["cos_q"] = np.cos(2 * np.pi * frame["Квартал"] / 4)
 
         future_x = pd.DataFrame({
-            feature: feature_models[feature].predict(future_periods.reshape(-1, 1))
+            feature: [frame[feature].iloc[-1]] * forecast_horizon
             for feature in features
         })
 
@@ -313,8 +301,7 @@ def split_and_scale_time_series_data(
     if scaler is None:
         scaler = StandardScaler()
 
-    # FIT scaler on ALL historical data to ensure validation values are properly scaled
-    scaler.fit(history_df[features])
+    scaler.fit(train_df[features])
 
     X_train_scaled = pd.DataFrame(
         scaler.transform(train_df[features]),
@@ -361,7 +348,7 @@ def train_and_predict(
     if algorithm == "arima":
         return _train_and_predict_arima(split_data)
 
-    use_scaled_features = algorithm in {"lasso", "ridge", "elasticnet", "linear_regression", "xgboost"}
+    use_scaled_features = algorithm in {"lasso", "ridge", "elasticnet", "linear_regression"}
 
     feature_suffix = "_scaled" if use_scaled_features else ""
     x_train = split_data[f"X_train{feature_suffix}"]
@@ -575,7 +562,7 @@ def detect_optimal_lags(series: pd.Series, forecast_horizon: int = 1, max_lags: 
         
         # Calculate ACF up to max_lags
         acf_values = acf(series_clean, nlags=min(max_lags, len(series_clean) - 2), fft=False)
-        
+        print(acf_values)
         # Confidence interval threshold (95% confidence)
         ci = significance_threshold / np.sqrt(len(series_clean))
         
