@@ -1,5 +1,7 @@
 from pydantic import BaseModel
+
 from models.Metric import Metric
+
 
 class TrainingRunCallbackRequest(BaseModel):
     status: str

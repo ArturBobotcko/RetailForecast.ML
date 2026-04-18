@@ -1,27 +1,27 @@
 import csv
 import random
 import tempfile
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
-import traceback
 
 import httpx
 import numpy as np
 import pandas as pd
 from fastapi import BackgroundTasks, FastAPI
-from DTOs.TrainingRunRequest import TrainingRunRequest
-from DTOs.TrainingRunCallbackRequest import TrainingRunCallbackRequest
-from DTOs.TrainingRunResponse import TrainingRunResponse
-from models.Model import Model
-from models.Metric import Metric
-from sklearn.linear_model import ElasticNetCV, LassoCV, LinearRegression, RidgeCV, Ridge
-from sklearn.preprocessing import StandardScaler, PolynomialFeatures
-from sklearn.pipeline import make_pipeline
-from xgboost import XGBRegressor
-from prophet import Prophet
 from pmdarima import auto_arima
+from prophet import Prophet
+from sklearn.linear_model import ElasticNetCV, LassoCV, LinearRegression, RidgeCV
+from sklearn.preprocessing import StandardScaler
 from statsmodels.tsa.stattools import acf
+from xgboost import XGBRegressor
+
+from DTOs.TrainingRunCallbackRequest import TrainingRunCallbackRequest
+from DTOs.TrainingRunRequest import TrainingRunRequest
+from DTOs.TrainingRunResponse import TrainingRunResponse
+from models.Metric import Metric
+from models.Model import Model
 
 app = FastAPI()
 DEFAULT_VALIDATION_FRACTION = 0.2
@@ -38,7 +38,9 @@ set_all_seeds(GLOBAL_RANDOM_SEED)
 
 
 @app.post("/api/trainingrun/start", response_model=TrainingRunResponse)
-async def training_run_start(request: TrainingRunRequest, background_tasks: BackgroundTasks):
+async def training_run_start(
+    request: TrainingRunRequest, background_tasks: BackgroundTasks
+):
     external_job_id = str(uuid4())
     background_tasks.add_task(process_training_run, request, external_job_id)
 
@@ -63,7 +65,9 @@ async def process_training_run(request: TrainingRunRequest, external_job_id: str
         if target_col not in data.columns:
             raise ValueError(f"Missing column '{target_col}'")
 
-        if not pd.api.types.is_numeric_dtype(pd.to_numeric(data[target_col], errors="coerce")):
+        if not pd.api.types.is_numeric_dtype(
+            pd.to_numeric(data[target_col], errors="coerce")
+        ):
             raise ValueError(f"Column '{target_col}' must be numeric")
 
         reserved_time_columns = {time_col, target_col}
@@ -71,17 +75,23 @@ async def process_training_run(request: TrainingRunRequest, external_job_id: str
             reserved_time_columns.update({"Год", "Квартал"})
 
         features = [
-            column for column in request.featureColumns
+            column
+            for column in request.featureColumns
             if column in data.columns
             and column not in reserved_time_columns
-            and pd.api.types.is_numeric_dtype(pd.to_numeric(data[column], errors="coerce"))
+            and pd.api.types.is_numeric_dtype(
+                pd.to_numeric(data[column], errors="coerce")
+            )
         ]
 
         if not features:
             features = [
-                column for column in data.columns
+                column
+                for column in data.columns
                 if column not in reserved_time_columns
-                and pd.api.types.is_numeric_dtype(pd.to_numeric(data[column], errors="coerce"))
+                and pd.api.types.is_numeric_dtype(
+                    pd.to_numeric(data[column], errors="coerce")
+                )
             ]
 
         if not features:
@@ -94,24 +104,30 @@ async def process_training_run(request: TrainingRunRequest, external_job_id: str
         resolved_frequency = detect_forecast_frequency(data, forecast_frequency)
 
         if resolved_frequency == "Quarterly":
-            frame, future_periods, forecast_timestamps = prepare_quarterly_training_data(
-                data,
-                target_col,
-                features,
-                forecast_horizon,
+            frame, future_periods, forecast_timestamps = (
+                prepare_quarterly_training_data(
+                    data,
+                    target_col,
+                    features,
+                    forecast_horizon,
+                )
             )
             split_time_col = "__period_index"
         else:
-            frame, future_periods, forecast_timestamps, resolved_time_col = prepare_yearly_training_data(
-                data,
-                time_col,
-                target_col,
-                features,
-                forecast_horizon,
+            frame, future_periods, forecast_timestamps, resolved_time_col = (
+                prepare_yearly_training_data(
+                    data,
+                    time_col,
+                    target_col,
+                    features,
+                    forecast_horizon,
+                )
             )
             split_time_col = resolved_time_col
 
-        LAG_PERIODS = detect_optimal_lags(frame[target_col], forecast_horizon=forecast_horizon)
+        LAG_PERIODS = detect_optimal_lags(
+            frame[target_col], forecast_horizon=forecast_horizon
+        )
 
         frame, lag_cols = add_lag_features(frame, target_col, LAG_PERIODS)
 
@@ -122,12 +138,16 @@ async def process_training_run(request: TrainingRunRequest, external_job_id: str
             frame["sin_q"] = np.sin(2 * np.pi * frame["Квартал"] / 4)
             frame["cos_q"] = np.cos(2 * np.pi * frame["Квартал"] / 4)
 
-        future_x = pd.DataFrame({
-            feature: [frame[feature].iloc[-1]] * forecast_horizon
-            for feature in features
-        })
+        future_x = pd.DataFrame(
+            {
+                feature: [frame[feature].iloc[-1]] * forecast_horizon
+                for feature in features
+            }
+        )
 
-        future_lag_df = build_future_lag_features(frame, target_col, LAG_PERIODS, forecast_horizon)
+        future_lag_df = build_future_lag_features(
+            frame, target_col, LAG_PERIODS, forecast_horizon
+        )
         future_x = pd.concat([future_x.reset_index(drop=True), future_lag_df], axis=1)
 
         all_features = features + lag_cols
@@ -147,20 +167,28 @@ async def process_training_run(request: TrainingRunRequest, external_job_id: str
         )
 
         actual = split_data["y_val"].to_numpy(dtype=float)
-        
+
         mae = float(np.mean(np.abs(actual - validation_pred)))
         rmse = float(np.sqrt(np.mean((actual - validation_pred) ** 2)))
         ss_res = float(np.sum((actual - validation_pred) ** 2))
         ss_tot = float(np.sum((actual - actual.mean()) ** 2))
         r2 = 1.0 if ss_tot == 0 else float(1 - (ss_res / ss_tot))
-        
+
         print(f"  ss_res: {ss_res:.2f}, ss_tot: {ss_tot:.2f}, R²: {r2:.4f}")
-        
+
         # Robust MAPE calculation (handles near-zero values)
         mape_threshold = 1e-6
         mape_mask = np.abs(actual) > mape_threshold
         if mape_mask.sum() > 0:
-            mape = float(np.mean(np.abs((actual[mape_mask] - validation_pred[mape_mask]) / actual[mape_mask])) * 100)
+            mape = float(
+                np.mean(
+                    np.abs(
+                        (actual[mape_mask] - validation_pred[mape_mask])
+                        / actual[mape_mask]
+                    )
+                )
+                * 100
+            )
             mape = min(mape, 1000.0)  # Cap at 1000% to avoid extreme values
         else:
             mape = 0.0
@@ -171,14 +199,16 @@ async def process_training_run(request: TrainingRunRequest, external_job_id: str
                 Metric(name="mae", value=round(mae, 6)),
                 Metric(name="rmse", value=round(rmse, 6)),
                 Metric(name="r2", value=round(r2, 6)),
-                Metric(name="mape", value=round(mape, 2))
+                Metric(name="mape", value=round(mape, 2)),
             ],
             forecast=[
                 {
                     "timestamp": timestamp.isoformat(),
                     "value": round(float(value), 4),
                 }
-                for timestamp, value in zip(forecast_timestamps, forecast_pred, strict=True)
+                for timestamp, value in zip(
+                    forecast_timestamps, forecast_pred, strict=True
+                )
             ],
             error=None,
             externalJobId=external_job_id,
@@ -206,7 +236,9 @@ async def download_dataset(download_url: str) -> Path:
     suffix = ".csv"
     content_disposition = response.headers.get("content-disposition", "")
     if "filename=" in content_disposition.lower():
-        file_name = content_disposition.split("filename=", maxsplit=1)[1].strip().strip('"')
+        file_name = (
+            content_disposition.split("filename=", maxsplit=1)[1].strip().strip('"')
+        )
         resolved_suffix = Path(file_name).suffix.lower()
         if resolved_suffix in {".csv", ".xls", ".xlsx"}:
             suffix = resolved_suffix
@@ -244,16 +276,16 @@ def load_data(file_path: Path) -> pd.DataFrame:
 
     raise ValueError(f"Unsupported file format: {suffix}")
 
+
 # Убирает строки с пустыми значениями в времени/целевой, сортирует, интерполирует пропуски в features
 def prepare_training_frame(
-    frame: pd.DataFrame,
-    time_col: str,
-    target_col: str,
-    features: list[str]
+    frame: pd.DataFrame, time_col: str, target_col: str, features: list[str]
 ) -> pd.DataFrame:
     frame = frame.dropna(subset=[time_col, target_col]).copy()
     if frame.empty:
-        raise ValueError("Dataset does not contain enough rows after removing empty time/target values")
+        raise ValueError(
+            "Dataset does not contain enough rows after removing empty time/target values"
+        )
 
     frame = frame.sort_values(time_col).reset_index(drop=True)
 
@@ -261,12 +293,16 @@ def prepare_training_frame(
         if frame[feature].isna().all():
             raise ValueError(f"Column '{feature}' contains only empty values")
 
-        frame[feature] = frame[feature].interpolate(method="linear", limit_direction="both")
+        frame[feature] = frame[feature].interpolate(
+            method="linear", limit_direction="both"
+        )
         frame[feature] = frame[feature].ffill().bfill()
 
     frame = frame.dropna(subset=features).copy()
     if len(frame.index) < 2:
-        raise ValueError("Dataset must contain at least two valid rows after filling empty values")
+        raise ValueError(
+            "Dataset must contain at least two valid rows after filling empty values"
+        )
 
     return frame
 
@@ -287,7 +323,9 @@ def split_and_scale_time_series_data(
         raise ValueError("validation_fraction must be between 0 and 1")
 
     if len(history_df.index) < 2:
-        raise ValueError("Need at least two historical rows to create train and validation splits")
+        raise ValueError(
+            "Need at least two historical rows to create train and validation splits"
+        )
 
     split_idx = int(len(history_df.index) * (1 - validation_fraction))
     split_idx = max(1, min(split_idx, len(history_df.index) - 1))
@@ -344,11 +382,16 @@ def train_and_predict(
 
     if algorithm == "prophet":
         return _train_and_predict_prophet(split_data, split_data.get("future_times"))
-    
+
     if algorithm == "arima":
         return _train_and_predict_arima(split_data)
 
-    use_scaled_features = algorithm in {"lasso", "ridge", "elasticnet", "linear_regression"}
+    use_scaled_features = algorithm in {
+        "lasso",
+        "ridge",
+        "elasticnet",
+        "linear_regression",
+    }
 
     feature_suffix = "_scaled" if use_scaled_features else ""
     x_train = split_data[f"X_train{feature_suffix}"]
@@ -358,11 +401,12 @@ def train_and_predict(
 
     model = build_model(algorithm, len(y_train))
     model.fit(x_train, y_train)
-    
+
     validation_pred = model.predict(x_val)
     forecast_pred = model.predict(x_future)
 
     return model, validation_pred, forecast_pred
+
 
 def _train_and_predict_prophet(split_data: dict, future_times) -> tuple:
     """Минимальная обёртка для Prophet — не трогает остальную логику"""
@@ -372,9 +416,27 @@ def _train_and_predict_prophet(split_data: dict, future_times) -> tuple:
 
     # Prophet требует колонку "ds" (datetime) и "y"
     ds_col = "ds"
-    train_df = train_df.rename(columns={"__period_index" if "__period_index" in train_df.columns else split_data.get("future_times", "Год"): ds_col})
-    val_df = val_df.rename(columns={"__period_index" if "__period_index" in val_df.columns else split_data.get("future_times", "Год"): ds_col})
-    future_df = future_df.rename(columns={"__period_index" if "__period_index" in future_df.columns else split_data.get("future_times", "Год"): ds_col})
+    train_df = train_df.rename(
+        columns={
+            "__period_index"
+            if "__period_index" in train_df.columns
+            else split_data.get("future_times", "Год"): ds_col
+        }
+    )
+    val_df = val_df.rename(
+        columns={
+            "__period_index"
+            if "__period_index" in val_df.columns
+            else split_data.get("future_times", "Год"): ds_col
+        }
+    )
+    future_df = future_df.rename(
+        columns={
+            "__period_index"
+            if "__period_index" in future_df.columns
+            else split_data.get("future_times", "Год"): ds_col
+        }
+    )
 
     # Преобразуем в datetime (Prophet любит настоящий datetime)
     train_df[ds_col] = pd.to_datetime(train_df[ds_col], errors="coerce")
@@ -386,11 +448,15 @@ def _train_and_predict_prophet(split_data: dict, future_times) -> tuple:
         yearly_seasonality=True,
         weekly_seasonality=False,
         daily_seasonality=False,
-        seasonality_mode="multiplicative"   # для ритейла обычно лучше
+        seasonality_mode="multiplicative",  # для ритейла обычно лучше
     )
 
     # Добавляем все фичи как регрессоры
-    features = [col for col in split_data["X_train"].columns if col not in {"__period_index", "Год", "Квартал"}]
+    features = [
+        col
+        for col in split_data["X_train"].columns
+        if col not in {"__period_index", "Год", "Квартал"}
+    ]
     for f in features:
         if f in train_df.columns:
             model.add_regressor(f)
@@ -404,9 +470,9 @@ def _train_and_predict_prophet(split_data: dict, future_times) -> tuple:
 
     return model, val_pred, forecast_pred
 
+
 def _train_and_predict_arima(split_data: dict) -> tuple:
     """Auto-ARIMA (SARIMAX) с автоматическим подбором параметров"""
-    train_df = split_data["train_df"].copy()
     val_df = split_data["val_df"].copy()
     future_df = split_data["future_df"].copy()
 
@@ -419,19 +485,23 @@ def _train_and_predict_arima(split_data: dict) -> tuple:
     model = auto_arima(
         y_train,
         exogenous=exog_train,
-        start_p=0, start_q=0,
-        max_p=3, max_q=3,
-        d=None,                # auto
+        start_p=0,
+        start_q=0,
+        max_p=3,
+        max_q=3,
+        d=None,  # auto
         seasonal=True,
-        m=4,                   # квартальная сезонность
-        start_P=0, start_Q=0,
-        max_P=2, max_Q=2,
+        m=4,  # квартальная сезонность
+        start_P=0,
+        start_Q=0,
+        max_P=2,
+        max_Q=2,
         D=None,
         trace=False,
-        error_action='ignore',
+        error_action="ignore",
         suppress_warnings=True,
         stepwise=True,
-        n_fits=20
+        n_fits=20,
     )
 
     # Predict
@@ -440,8 +510,14 @@ def _train_and_predict_arima(split_data: dict) -> tuple:
 
     return model, validation_pred, forecast_pred
 
+
 def resolve_model_algorithm(model_request: Model) -> str:
-    raw_value = (model_request.algorithm or model_request.name or "").strip().lower().replace("-", "_")
+    raw_value = (
+        (model_request.algorithm or model_request.name or "")
+        .strip()
+        .lower()
+        .replace("-", "_")
+    )
     aliases = {
         "linear": "linear_regression",
         "linearregression": "linear_regression",
@@ -479,17 +555,19 @@ def build_model(algorithm: str, train_size: int):
 
     if algorithm == "linear_regression":
         return LinearRegression()
-    
+
     if algorithm == "lasso":
         # Data-adaptive alpha grid for Lasso
         alphas = np.logspace(-3, 2, 12) if train_size > 50 else np.logspace(-2, 1, 8)
-        return LassoCV(alphas=alphas, cv=cv_folds, max_iter=50000, tol=1e-4, random_state=42)
-    
+        return LassoCV(
+            alphas=alphas, cv=cv_folds, max_iter=50000, tol=1e-4, random_state=42
+        )
+
     if algorithm == "ridge":
         # Data-adaptive alpha grid for Ridge
         alphas = np.logspace(-3, 2, 12) if train_size > 50 else np.logspace(-2, 1, 8)
         return RidgeCV(alphas=alphas, cv=cv_folds)
-    
+
     if algorithm == "elasticnet":
         # Data-adaptive hyperparameters
         alphas = np.logspace(-3, 2, 12) if train_size > 50 else np.logspace(-2, 1, 8)
@@ -500,9 +578,9 @@ def build_model(algorithm: str, train_size: int):
             cv=cv_folds,
             max_iter=50000,
             tol=1e-4,
-            random_state=42
+            random_state=42,
         )
-    
+
     if algorithm == "xgboost":
         # Aggressive regularization for small datasets
         if train_size < 50:
@@ -526,7 +604,7 @@ def build_model(algorithm: str, train_size: int):
             min_child_weight = 3
             subsample = 0.8
             colsample_bytree = 0.8
-        
+
         return XGBRegressor(
             n_estimators=n_estimators,
             learning_rate=learning_rate,
@@ -539,9 +617,8 @@ def build_model(algorithm: str, train_size: int):
             reg_lambda=2.0 if train_size < 50 else 1.0,  # Stronger L2 for small data
             random_state=42,
             objective="reg:squarederror",
-            early_stopping_rounds=5 if train_size > 50 else None
+            early_stopping_rounds=5 if train_size > 50 else None,
         )
-    
 
     if algorithm == "prophet":
         return "prophet"
@@ -550,7 +627,13 @@ def build_model(algorithm: str, train_size: int):
 
     raise ValueError(f"Unsupported model algorithm '{algorithm}'")
 
-def detect_optimal_lags(series: pd.Series, forecast_horizon: int = 1, max_lags: int = 12, significance_threshold: float = 1.96) -> list[int]:
+
+def detect_optimal_lags(
+    series: pd.Series,
+    forecast_horizon: int = 1,
+    max_lags: int = 12,
+    significance_threshold: float = 1.96,
+) -> list[int]:
     """
     Detect optimal lag periods using ACF (autocorrelation function).
     Returns lags that are statistically significant.
@@ -559,35 +642,38 @@ def detect_optimal_lags(series: pd.Series, forecast_horizon: int = 1, max_lags: 
         series_clean = series.dropna()
         if len(series_clean) < 10:
             return [1]
-        
+
         # Calculate ACF up to max_lags
-        acf_values = acf(series_clean, nlags=min(max_lags, len(series_clean) - 2), fft=False)
+        acf_values = acf(
+            series_clean, nlags=min(max_lags, len(series_clean) - 2), fft=False
+        )
         print(acf_values)
         # Confidence interval threshold (95% confidence)
         ci = significance_threshold / np.sqrt(len(series_clean))
-        
+
         # Find significant lags (lags where ACF exceeds confidence interval)
-        significant_lags = [i for i in range(1, len(acf_values)) 
-                           if abs(acf_values[i]) > ci]
-        
+        significant_lags = [
+            i for i in range(1, len(acf_values)) if abs(acf_values[i]) > ci
+        ]
+
         if not significant_lags:
             return [1]  # Fallback to lag-1 if none significant
-        
+
         # Ensure we have at least forecast_horizon lags
         min_lags = max(1, forecast_horizon)
         if max(significant_lags) < min_lags:
             significant_lags = list(range(1, min_lags + 1))
-        
+
         return sorted(significant_lags[:4])  # Cap at 4 lags for performance
-    except Exception as e:
+    except Exception:
         # Fallback to default lags if ACF fails
         return [1, 2]
 
 
 def add_lag_features(
-        frame: pd.DataFrame,
-        target_col: str,
-        lags: list[int],
+    frame: pd.DataFrame,
+    target_col: str,
+    lags: list[int],
 ) -> tuple[pd.DataFrame, list[str]]:
     frame = frame.copy()
     lag_cols = []
@@ -598,6 +684,7 @@ def add_lag_features(
 
     frame = frame.dropna(subset=lag_cols).reset_index(drop=True)
     return frame, lag_cols
+
 
 def build_future_lag_features(
     frame: pd.DataFrame,
@@ -611,9 +698,12 @@ def build_future_lag_features(
         row = {}
         for lag in lags:
             idx = len(target_history) - lag + h
-            row[f"{target_col}_lag{lag}"] = target_history[max(0, min(idx, len(target_history) - 1))]
+            row[f"{target_col}_lag{lag}"] = target_history[
+                max(0, min(idx, len(target_history) - 1))
+            ]
         rows.append(row)
     return pd.DataFrame(rows)
+
 
 def normalize_forecast_frequency(value: str | None) -> str:
     normalized = (value or "Auto").strip().lower()
@@ -665,8 +755,7 @@ def prepare_yearly_training_data(
         dtype=float,
     )
     forecast_timestamps = [
-        datetime(int(period), 1, 1, tzinfo=timezone.utc)
-        for period in future_periods
+        datetime(int(period), 1, 1, tzinfo=timezone.utc) for period in future_periods
     ]
     return frame, future_periods, forecast_timestamps, time_col
 
@@ -690,25 +779,33 @@ def prepare_quarterly_training_data(
 
     frame = frame.dropna(subset=["Год", "Квартал", target_col]).copy()
     if frame.empty:
-        raise ValueError("Dataset does not contain enough rows after removing empty time/target values")
+        raise ValueError(
+            "Dataset does not contain enough rows after removing empty time/target values"
+        )
 
     frame["Квартал"] = frame["Квартал"].astype(int)
     if not frame["Квартал"].between(1, 4).all():
         raise ValueError("Column 'Квартал' must contain values from 1 to 4")
 
-    frame["__period_index"] = (frame["Год"].astype(int) * 4 + (frame["Квартал"] - 1)).astype(float)
+    frame["__period_index"] = (
+        frame["Год"].astype(int) * 4 + (frame["Квартал"] - 1)
+    ).astype(float)
     frame = frame.sort_values(["Год", "Квартал"]).reset_index(drop=True)
 
     for feature in features:
         if frame[feature].isna().all():
             raise ValueError(f"Column '{feature}' contains only empty values")
 
-        frame[feature] = frame[feature].interpolate(method="linear", limit_direction="both")
+        frame[feature] = frame[feature].interpolate(
+            method="linear", limit_direction="both"
+        )
         frame[feature] = frame[feature].ffill().bfill()
 
     frame = frame.dropna(subset=features).copy()
     if len(frame.index) < 2:
-        raise ValueError("Dataset must contain at least two valid rows after filling empty values")
+        raise ValueError(
+            "Dataset must contain at least two valid rows after filling empty values"
+        )
 
     last_year = int(frame.iloc[-1]["Год"])
     last_quarter = int(frame.iloc[-1]["Квартал"])
@@ -727,7 +824,11 @@ def prepare_quarterly_training_data(
             current_year += 1
 
         future_periods.append(float(current_index))
-        forecast_timestamps.append(datetime(current_year, quarter_to_month(current_quarter), 1, tzinfo=timezone.utc))
+        forecast_timestamps.append(
+            datetime(
+                current_year, quarter_to_month(current_quarter), 1, tzinfo=timezone.utc
+            )
+        )
 
     return frame, np.array(future_periods, dtype=float), forecast_timestamps
 

@@ -1,9 +1,11 @@
-import pandas as pd
 import argparse
 from pathlib import Path
+
+import numpy as np
+import pandas as pd
 from sklearn.linear_model import Lasso, LinearRegression
 from sklearn.preprocessing import StandardScaler
-import numpy as np
+
 
 def load_data(file_path):
     try:
@@ -13,23 +15,38 @@ def load_data(file_path):
         print(f"Ошибка при загрузке файла {file_path}: {e}")
         return None
 
+
 def main():
     parser = argparse.ArgumentParser(
         description="Прогноз выбранного показателя с помощью Lasso Regression",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=
-        """
+        epilog="""
             Примеры использования:
             python forecast_lasso.py -f data/finance.xlsx -t "Чистая прибыль, млрд.руб." -p 2030
             python forecast_lasso.py --file finance.xlsx --target "Выручка, млрд.руб." --period 2028
-        """
+        """,
     )
-    parser.add_argument('-f', '--file', type=str, required=True,
-                        help='Путь к файлу с данными (например, "data/finance.xlsx")')
-    parser.add_argument('-t', '--target', type=str, required=True,
-                        help='Название столбца с прогнозируемым показателем (например, "Чистая прибыль, млрд.руб.")')
-    parser.add_argument('-p', '--period', type=int, required=True,
-                        help='Год, до которого нужно сделать прогноз (например, 2030)')
+    parser.add_argument(
+        "-f",
+        "--file",
+        type=str,
+        required=True,
+        help='Путь к файлу с данными (например, "data/finance.xlsx")',
+    )
+    parser.add_argument(
+        "-t",
+        "--target",
+        type=str,
+        required=True,
+        help='Название столбца с прогнозируемым показателем (например, "Чистая прибыль, млрд.руб.")',
+    )
+    parser.add_argument(
+        "-p",
+        "--period",
+        type=int,
+        required=True,
+        help="Год, до которого нужно сделать прогноз (например, 2030)",
+    )
 
     args = parser.parse_args()
 
@@ -38,7 +55,7 @@ def main():
     if data is None:
         return
 
-    year_col = 'Год'
+    year_col = "Год"
     target_col = args.target.strip()
 
     if year_col not in data.columns or target_col not in data.columns:
@@ -49,7 +66,12 @@ def main():
         print(f"Ошибка: '{target_col}' должен быть числовым")
         return
 
-    features = [col for col in data.columns if col not in [year_col, target_col] and pd.api.types.is_numeric_dtype(data[col])]
+    features = [
+        col
+        for col in data.columns
+        if col not in [year_col, target_col]
+        and pd.api.types.is_numeric_dtype(data[col])
+    ]
 
     if not features:
         print("Ошибка: Нет числовых признаков")
@@ -68,7 +90,12 @@ def main():
         lr.fit(data[year_col].values.reshape(-1, 1), data[feat].values)
         feature_models[feat] = lr
 
-    future_X = pd.DataFrame({feat: feature_models[feat].predict(future_years.reshape(-1, 1)) for feat in features})
+    future_X = pd.DataFrame(
+        {
+            feat: feature_models[feat].predict(future_years.reshape(-1, 1))
+            for feat in features
+        }
+    )
 
     scaler = StandardScaler()
     X_historical_scaled = scaler.fit_transform(data[features])
@@ -79,9 +106,12 @@ def main():
 
     y_pred = lasso.predict(future_X_scaled)
 
-    forecast_df = pd.DataFrame({'Год': future_years, f'Прогноз {target_col}': np.round(y_pred, 4)})
+    forecast_df = pd.DataFrame(
+        {"Год": future_years, f"Прогноз {target_col}": np.round(y_pred, 4)}
+    )
     print("\n📊 Прогноз:\n")
     print(forecast_df.to_string(index=False))
+
 
 if __name__ == "__main__":
     main()

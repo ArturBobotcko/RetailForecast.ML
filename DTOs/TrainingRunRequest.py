@@ -1,5 +1,7 @@
 from pydantic import BaseModel
+
 from models.Model import Model
+
 
 class TrainingRunRequest(BaseModel):
     trainingRunId: int
