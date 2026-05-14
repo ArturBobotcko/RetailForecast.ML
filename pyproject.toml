@@ -79,3 +79,11 @@ dependencies = [
     "websockets==16.0",
     "xgboost==3.2.0",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
