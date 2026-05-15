@@ -20,6 +20,7 @@ class ForecastPipelineResult:
     validation_actual: np.ndarray
     validation_pred: np.ndarray
     forecast_pred: np.ndarray
+    training_target: pd.Series
     feature_columns: list[str]
     lag_periods: list[int]
     validation_horizon: int
@@ -81,6 +82,7 @@ def run_regression_forecast(
         validation_actual=validation_actual,
         validation_pred=np.asarray(validation_pred, dtype=float),
         forecast_pred=np.asarray(forecast_pred, dtype=float),
+        training_target=split_data["y_train"].copy(),
         feature_columns=all_features,
         lag_periods=lag_periods,
         validation_horizon=len(validation_actual),

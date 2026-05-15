@@ -77,6 +77,8 @@ async def process_training_run(request, external_job_id: str) -> None:
             metrics=calculate_validation_metrics(
                 forecast_result.validation_actual,
                 forecast_result.validation_pred,
+                forecast_result.training_target,
+                resolved_frequency,
             ),
             forecast=[
                 {
